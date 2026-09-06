@@ -106,15 +106,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Best-effort: avoids anonymous pull rate limits for transitive base
-      # images (golang, alpine). The build still works without these secrets.
-      - name: Log in to Docker Hub (best-effort, transitive pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        continue-on-error: true
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Record git SHA
         run: echo "GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
@@ -166,13 +157,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub (best-effort, transitive pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        continue-on-error: true
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and load
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -218,13 +202,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub (best-effort, transitive pulls)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        continue-on-error: true
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # The adapter carries its own independent semver (docker/scanner-adapter/
       # VERSION); also alias the `1` series tag the compose file references.
