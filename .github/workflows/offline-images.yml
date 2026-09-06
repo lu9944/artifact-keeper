@@ -41,6 +41,9 @@ permissions:
   contents: write
   packages: read
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
   resolve:
     name: Resolve version / ref
@@ -187,7 +190,9 @@ jobs:
 
   build-scanner-adapter:
     name: Build scanner-adapter image (linux/amd64)
-    if: ${{ inputs.include_scanner_adapter == 'true' }}
+    # Boolean dispatch inputs arrive as boolean true OR the string 'true'
+    # depending on how they are submitted; accept both.
+    if: ${{ inputs.include_scanner_adapter == 'true' || inputs.include_scanner_adapter == true }}
     needs: [resolve]
     runs-on: ubuntu-24.04
     steps:
@@ -246,7 +251,9 @@ jobs:
 
   build-web:
     name: Pull web image (linux/amd64)
-    if: ${{ inputs.include_web == 'true' }}
+    # Boolean dispatch inputs arrive as boolean true OR the string 'true'
+    # depending on how they are submitted; accept both.
+    if: ${{ inputs.include_web == 'true' || inputs.include_web == true }}
     needs: [resolve]
     runs-on: ubuntu-24.04
     steps:
