@@ -1,0 +1,379 @@
+name: Build Offline Image Bundle
+
+# Builds the AK backend/openscap/scanner-adapter images (linux/amd64) from
+# source at a chosen ref, optionally pulls the AK web image from GHCR (the web
+# image is built in the separate artifact-keeper-web repo), then `docker save`s
+# everything into a single tar.gz bundle and uploads it to the GitHub release.
+# On the offline host: `docker load -i <bundle.tar.gz>` then `docker compose up`
+# with ARTIFACT_KEEPER_VERSION pinned to the bundled version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Image version to bundle, e.g. 1.8.0. A leading "v" is accepted and
+          stripped. Also determines the GitHub release tag (v<version>).
+        required: true
+        type: string
+      ref:
+        description: >-
+          Git ref to build from. Defaults to the v<version> tag when empty.
+        required: false
+        default: ""
+        type: string
+      include_web:
+        description: >-
+          Also pull the AK web image from ghcr.io/artifact-keeper/artifact-keeper-web.
+          The web image is built in the artifact-keeper-web repo, so this workflow
+          can only PULL it; the package must be readable by the GITHUB_TOKEN
+          (public package, or granted cross-repo package access).
+        required: false
+        default: true
+        type: boolean
+      include_scanner_adapter:
+        description: Also build and include the scanner-adapter image.
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  resolve:
+    name: Resolve version / ref
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.out.outputs.version }}
+      release_tag: ${{ steps.out.outputs.release_tag }}
+      git_ref: ${{ steps.out.outputs.git_ref }}
+    steps:
+      - name: Normalize inputs
+        id: out
+        run: |
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "::error::version must be a semver like 1.8.0 (got '${{ inputs.version }}')"
+            exit 1
+          fi
+          ref="${{ inputs.ref }}"
+          if [ -z "$ref" ]; then ref="v${version}"; fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "git_ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}  release_tag=v${version}  git_ref=${ref}"
+
+  build-backend:
+    name: Build backend image (linux/amd64)
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.git_ref }}
+
+      # The backend image compiles Rust inside Docker, which can exhaust the
+      # ~14GB free disk on a hosted amd64 runner. Mirrors docker-publish.yml.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Best-effort: avoids anonymous pull rate limits for transitive base
+      # images (golang, alpine). The build still works without these secrets.
+      - name: Log in to Docker Hub (best-effort, transitive pulls)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Record git SHA
+        run: echo "GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build and load
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.REGISTRY }}/artifact-keeper/artifact-keeper-backend:${{ needs.resolve.outputs.version }}
+          build-args: |
+            GIT_SHA=${{ env.GIT_SHA }}
+            APP_VERSION=${{ needs.resolve.outputs.version }}
+          # Re-run the package-refresh / runtime / grype stages against current
+          # state every time instead of serving them from a stale cache.
+          no-cache-filters: rootfs-builder,grype-bin,grype-db-seed,runtime
+
+      - name: Save image
+        run: |
+          docker save ghcr.io/artifact-keeper/artifact-keeper-backend:${{ needs.resolve.outputs.version }} \
+            | gzip > offline-image-backend.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: offline-image-backend
+          path: offline-image-backend.tar.gz
+          retention-days: 7
+
+  build-openscap:
+    name: Build openscap image (linux/amd64)
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.git_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (best-effort, transitive pulls)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and load
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.openscap
+          platforms: linux/amd64
+          load: true
+          tags: ghcr.io/artifact-keeper/artifact-keeper-openscap:${{ needs.resolve.outputs.version }}
+          no-cache-filters: rootfs-builder
+
+      - name: Save image
+        run: |
+          docker save ghcr.io/artifact-keeper/artifact-keeper-openscap:${{ needs.resolve.outputs.version }} \
+            | gzip > offline-image-openscap.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: offline-image-openscap
+          path: offline-image-openscap.tar.gz
+          retention-days: 7
+
+  build-scanner-adapter:
+    name: Build scanner-adapter image (linux/amd64)
+    if: ${{ inputs.include_scanner_adapter == 'true' }}
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.git_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (best-effort, transitive pulls)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The adapter carries its own independent semver (docker/scanner-adapter/
+      # VERSION); also alias the `1` series tag the compose file references.
+      - name: Read adapter version
+        run: echo "ADAPTER_VERSION=$(cat docker/scanner-adapter/VERSION)" >> "$GITHUB_ENV"
+
+      - name: Build and load
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.scanner-adapter
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:${{ env.ADAPTER_VERSION }}
+            ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:1
+
+      - name: Save image
+        run: |
+          docker save \
+            ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:${ADAPTER_VERSION} \
+            ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:1 \
+            | gzip > offline-image-scanner-adapter.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: offline-image-scanner-adapter
+          path: offline-image-scanner-adapter.tar.gz
+          retention-days: 7
+
+  build-web:
+    name: Pull web image (linux/amd64)
+    if: ${{ inputs.include_web == 'true' }}
+    needs: [resolve]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull web image
+        run: |
+          docker pull ghcr.io/artifact-keeper/artifact-keeper-web:${{ needs.resolve.outputs.version }}
+
+      - name: Save image
+        run: |
+          docker save ghcr.io/artifact-keeper/artifact-keeper-web:${{ needs.resolve.outputs.version }} \
+            | gzip > offline-image-web.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: offline-image-web
+          path: offline-image-web.tar.gz
+          retention-days: 7
+
+  package-bundle:
+    name: Package offline bundle and upload to release
+    needs: [resolve, build-backend, build-openscap, build-scanner-adapter, build-web]
+    # Optional build jobs are skipped (not failed) when their include_* input
+    # is off; `always()` keeps this job from being skipped along with them,
+    # and the guard step below fails it if any required job actually failed.
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail if a required build job failed
+        run: |
+          set -eu
+          for spec in \
+            "build-backend:${{ needs.build-backend.result }}" \
+            "build-openscap:${{ needs.build-openscap.result }}"; do
+            name="${spec%%:*}"; result="${spec##*:}"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name ended with '$result'"
+              exit 1
+            fi
+          done
+          for spec in \
+            "build-scanner-adapter:${{ needs.build-scanner-adapter.result }}" \
+            "build-web:${{ needs.build-web.result }}"; do
+            name="${spec%%:*}"; result="${spec##*:}"
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "::error::$name ended with '$result'"
+              exit 1
+            fi
+          done
+
+      - name: Set bundle variables
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=${{ needs.resolve.outputs.release_tag }}" >> "$GITHUB_ENV"
+          echo "GIT_REF=${{ needs.resolve.outputs.git_ref }}" >> "$GITHUB_ENV"
+          echo "BUNDLE=artifact-keeper-images-${VERSION}-linux-amd64.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Download built images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: offline-image-*
+          merge-multiple: true
+          path: images
+
+      - name: Load images into the local daemon
+        run: |
+          for f in images/offline-image-*.tar.gz; do
+            echo "Loading $f"
+            docker load -i "$f"
+          done
+
+      - name: Combine into a single bundle
+        run: |
+          IMAGES=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+            | awk -F: '$1 ~ /^ghcr\.io\/artifact-keeper\/artifact-keeper-/ {print}' | sort -u)
+          if [ -z "$IMAGES" ]; then
+            echo "::error::no ghcr.io/artifact-keeper images found to bundle"
+            exit 1
+          fi
+          echo "Bundling images:"
+          printf '%s\n' "$IMAGES"
+          docker save $IMAGES | gzip > "$BUNDLE"
+          ls -lh "$BUNDLE"
+
+      - name: Write manifest and checksums
+        run: |
+          {
+            echo "Artifact Keeper offline image bundle (linux/amd64)"
+            echo "Version: ${VERSION}"
+            echo "Built from ref: ${GIT_REF}"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "Deploy on the offline host:"
+            echo "  docker load -i ${BUNDLE}"
+            echo "  # then reference the exact tags below (e.g. ARTIFACT_KEEPER_VERSION=${VERSION})"
+            echo
+            docker images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}' \
+              | grep '^ghcr.io/artifact-keeper/artifact-keeper-' | sort
+          } > images-manifest.txt
+          cat images-manifest.txt
+          sha256sum "$BUNDLE" images-manifest.txt > SHA256SUMS
+          echo
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Creating draft release ${RELEASE_TAG}"
+            gh release create "${RELEASE_TAG}" \
+              --repo "${{ github.repository }}" \
+              --draft \
+              --target "${GIT_REF}" \
+              --title "Artifact Keeper ${VERSION}" \
+              --notes "Offline deployment image bundle (linux/amd64). Load the bundle with \`docker load -i\`, then pin ARTIFACT_KEEPER_VERSION=${VERSION} in docker-compose."
+          fi
+          gh release upload "${RELEASE_TAG}" \
+            "$BUNDLE" SHA256SUMS images-manifest.txt \
+            --repo "${{ github.repository }}" --clobber
+          echo "Assets attached to https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
