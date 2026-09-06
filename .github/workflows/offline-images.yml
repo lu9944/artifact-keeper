@@ -31,6 +31,14 @@ on:
         required: false
         default: true
         type: boolean
+      web_tag:
+        description: >-
+          Tag of the AK web image to pull. The web repo versions independently
+          from AK (it publishes no per-AK-version tag), so this defaults to
+          "latest", which is what docker-compose.yml references.
+        required: false
+        default: latest
+        type: string
       include_scanner_adapter:
         description: Also build and include the scanner-adapter image.
         required: false
@@ -266,11 +274,11 @@ jobs:
 
       - name: Pull web image
         run: |
-          docker pull ghcr.io/artifact-keeper/artifact-keeper-web:${{ needs.resolve.outputs.version }}
+          docker pull ghcr.io/artifact-keeper/artifact-keeper-web:${{ inputs.web_tag }}
 
       - name: Save image
         run: |
-          docker save ghcr.io/artifact-keeper/artifact-keeper-web:${{ needs.resolve.outputs.version }} \
+          docker save ghcr.io/artifact-keeper/artifact-keeper-web:${{ inputs.web_tag }} \
             | gzip > offline-image-web.tar.gz
 
       - name: Upload image artifact
